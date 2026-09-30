@@ -9,6 +9,14 @@
  * Sources are addressed by their CoreMIDI source index, shown in the
  * listing as "index:0".
  *
+ * Reconnection: when a device is unplugged its endpoint disappears (or goes
+ * offline), and when it is plugged in again it gets a new endpoint, possibly
+ * with a different index.  So each device is also remembered by NAME.  The
+ * main thread checks a few times a second whether each endpoint is still
+ * alive, reports a loss, and looks for an endpoint with the same names; when
+ * one appears it is connected again.  Events keep the index label the device
+ * had at start-up, so the output stays consistent.
+ *
  * NOTE: uses the classic MIDIInputPortCreate() API, which delivers MIDI 1.0
  * byte streams and works on every macOS version.  It is marked deprecated in
  * the macOS 11+ SDK in favour of the MIDI 2.0 event-list API; the
@@ -36,9 +44,15 @@ const char *const backend_port_help = "a number from the list such as 1 or 1:0, 
 
 struct source {
     mm_parser parser;         /* per-source byte-stream state */
-    MIDIEndpointRef ep;
-    int index;
+    MIDIEndpointRef ep;       /* current endpoint (changes when re-plugged) */
+    int index;                /* label shown in the output (index at start) */
+    int connected;
+    int lost;                 /* a loss has been reported; waiting to return */
+    char device[96], name[96];
+    char label[200];          /* "device : port", for messages */
 };
+
+#define CHECK_INTERVAL_NS (250 * 1000 * 1000)
 
 static MIDIClientRef client;
 static MIDIPortRef inport;
@@ -174,12 +188,27 @@ void backend_describe(const mm_port *p, char *buf, size_t n)
         snprintf(buf, n, "%s : %s", p->device, p->name);
 }
 
-/* Called on a CoreMIDI thread for each parsed event. */
+/* Called (with cb_lock held) for each event parsed on a CoreMIDI thread. */
 static void deliver(const mm_event *ev)
 {
-    pthread_mutex_lock(&cb_lock);
     if (user_cb)
         user_cb(ev);
+}
+
+/* Report a device loss / return from the main thread. */
+static void notify(const struct source *s, int type)
+{
+    mm_event e;
+
+    memset(&e, 0, sizeof e);
+    e.type = type;
+    e.time_ns = host_to_ns(0);
+    e.src_client = s->index;
+    e.src_port = 0;
+    e.text = s->label;
+    pthread_mutex_lock(&cb_lock);
+    if (user_cb)
+        user_cb(&e);
     pthread_mutex_unlock(&cb_lock);
 }
 
@@ -190,10 +219,12 @@ static void read_proc(const MIDIPacketList *pl, void *readRefCon, void *srcConnR
     const MIDIPacket *pk = &pl->packet[0];
 
     (void)readRefCon;
+    pthread_mutex_lock(&cb_lock);         /* also keeps output and resets orderly */
     for (UInt32 i = 0; i < pl->numPackets; i++) {
         mm_parser_feed(parser, pk->data, pk->length, host_to_ns(pk->timeStamp), deliver);
         pk = MIDIPacketNext(pk);
     }
+    pthread_mutex_unlock(&cb_lock);
 }
 
 int backend_start(const mm_port *sel, int n)
@@ -228,15 +259,92 @@ int backend_start(const mm_port *sel, int n)
             fprintf(stderr, "MIDI source %d no longer exists\n", sel[i].client);
             return -1;
         }
-        sources[nsources].ep = ep;
-        sources[nsources].index = sel[i].client;
-        mm_parser_init(&sources[nsources].parser, sel[i].client, sel[i].port);
+        {
+            struct source *s = &sources[nsources];
+            mm_port p;
+
+            s->ep = ep;
+            s->index = sel[i].client;
+            if (fill_port(sel[i].client, &p) < 0)
+                p = sel[i];               /* fall back to what we were given */
+            snprintf(s->device, sizeof s->device, "%s", p.device);
+            snprintf(s->name, sizeof s->name, "%s", p.name);
+            if (strcmp(s->device, s->name) == 0)
+                snprintf(s->label, sizeof s->label, "%s", s->name);
+            else
+                snprintf(s->label, sizeof s->label, "%s : %s", s->device, s->name);
+            mm_parser_init(&s->parser, sel[i].client, sel[i].port);
+        }
         nsources++;
     }
 
     mach_timebase_info(&timebase);
     start_host = mach_absolute_time();
     return 0;
+}
+
+static int endpoint_alive(MIDIEndpointRef ep)
+{
+    SInt32 offline = 0;
+
+    return MIDIObjectGetIntegerProperty(ep, kMIDIPropertyOffline, &offline) == noErr &&
+           !offline;
+}
+
+/* Find an online endpoint with this device's names that we are not already
+ * listening to.  Returns 0 and sets *ep if found. */
+static int find_source(const struct source *s, MIDIEndpointRef *ep)
+{
+    unsigned long count = (unsigned long)MIDIGetNumberOfSources();
+
+    for (unsigned long i = 0; i < count; i++) {
+        mm_port p;
+        MIDIEndpointRef cand;
+        int taken = 0;
+
+        if (fill_port((long)i, &p) < 0)
+            continue;
+        if (strcmp(p.device, s->device) != 0 || strcmp(p.name, s->name) != 0)
+            continue;
+        cand = MIDIGetSource((ItemCount)i);
+        for (int j = 0; j < nsources; j++)
+            if (&sources[j] != s && sources[j].connected && sources[j].ep == cand)
+                taken = 1;
+        if (taken)
+            continue;
+        *ep = cand;
+        return 0;
+    }
+    return -1;
+}
+
+/* Check every device is still there; reconnect any that went away. */
+static void maintain(void)
+{
+    for (int i = 0; i < nsources; i++) {
+        struct source *s = &sources[i];
+        MIDIEndpointRef ep;
+
+        if (s->connected && !endpoint_alive(s->ep)) {
+            MIDIPortDisconnectSource(inport, s->ep);
+            s->connected = 0;
+            s->lost = 1;
+            notify(s, MM_DEVICE_LOST);
+        }
+        if (!s->connected && find_source(s, &ep) == 0) {
+            pthread_mutex_lock(&cb_lock);
+            mm_parser_reset(&s->parser);      /* drop any half-received message */
+            pthread_mutex_unlock(&cb_lock);
+            if (MIDIPortConnectSource(inport, ep, &s->parser) == noErr) {
+                s->ep = ep;
+                s->connected = 1;
+                if (s->lost) {
+                    s->lost = 0;
+                    notify(s, MM_DEVICE_BACK);
+                }
+            }
+        }
+    }
 }
 
 void backend_run(mm_event_cb cb, volatile sig_atomic_t *running)
@@ -248,19 +356,26 @@ void backend_run(mm_event_cb cb, volatile sig_atomic_t *running)
     /* Connect only now, so nothing arrives before the caller is ready. */
     for (int i = 0; i < nsources; i++) {
         OSStatus st = MIDIPortConnectSource(inport, sources[i].ep, &sources[i].parser);
-        if (st != noErr)
+        if (st == noErr) {
+            sources[i].connected = 1;
+        } else {
             fprintf(stderr, "Cannot connect to MIDI source %d (error %d)\n",
                     sources[i].index, (int)st);
+            sources[i].lost = 1;          /* keep trying; report when it works */
+        }
     }
 
-    /* Events arrive on CoreMIDI's own thread; this thread just waits. */
+    /* Events arrive on CoreMIDI's own thread; this thread watches for
+     * devices being unplugged and plugged back in. */
     while (*running) {
-        struct timespec ts = { 0, 100 * 1000 * 1000 };
+        struct timespec ts = { 0, CHECK_INTERVAL_NS };
         nanosleep(&ts, NULL);
+        maintain();
     }
 
     for (int i = 0; i < nsources; i++)
-        MIDIPortDisconnectSource(inport, sources[i].ep);
+        if (sources[i].connected)
+            MIDIPortDisconnectSource(inport, sources[i].ep);
     pthread_mutex_lock(&cb_lock);
     user_cb = NULL;
     pthread_mutex_unlock(&cb_lock);

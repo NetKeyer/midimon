@@ -23,6 +23,8 @@ typedef struct mm_parser {
 
 void mm_parser_init(mm_parser *p, int src_client, int src_port);
 void mm_parser_free(mm_parser *p);
+/* Forget any partly received message (e.g. after a device reconnects). */
+void mm_parser_reset(mm_parser *p);
 void mm_parser_feed(mm_parser *p, const unsigned char *buf, size_t n,
                     uint64_t time_ns, mm_event_cb cb);
 

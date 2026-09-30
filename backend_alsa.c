@@ -5,6 +5,15 @@
  * kernel when the event arrives (nanosecond resolution), not when this
  * program gets scheduled.  If the kernel does not stamp an event, the time
  * at which we read it is used instead.
+ *
+ * Reconnection: when a USB device is unplugged, the kernel removes its ALSA
+ * client and with it our subscription; when it is plugged in again it may get
+ * a different client number.  So each device we listen to is remembered by
+ * NAME.  We notice the loss (our subscription has vanished, usually announced
+ * immediately by the System:Announce port), report it, and keep looking for
+ * a port with the same names; when it appears we subscribe again.  Events are
+ * always labelled with the address the device had when we started, so the
+ * output stays consistent across a reconnect.
  */
 #define _GNU_SOURCE
 #include <alsa/asoundlib.h>
@@ -25,6 +34,17 @@ static snd_seq_t *seq;
 static int my_port = -1, queue = -1;
 static struct timespec start_mono;
 static int warned_fallback;
+
+#define CHECK_INTERVAL_MS 250     /* how often to verify / look for devices */
+
+struct want {
+    mm_port orig;                 /* names, and the address shown in the output */
+    snd_seq_addr_t cur;           /* where the device is right now              */
+    int connected;
+    char label[200];              /* "device : port", for messages              */
+};
+static struct want *wants;
+static int nwants;
 
 int backend_open(void)
 {
@@ -112,6 +132,119 @@ static int subscribe(snd_seq_addr_t src)
     return snd_seq_subscribe_port(seq, sub);
 }
 
+/* Does our subscription from 'src' to our input port still exist? */
+static int subscription_exists(snd_seq_addr_t src)
+{
+    snd_seq_port_subscribe_t *sub;
+    snd_seq_addr_t dst = { snd_seq_client_id(seq), my_port };
+
+    snd_seq_port_subscribe_alloca(&sub);
+    snd_seq_port_subscribe_set_sender(sub, &src);
+    snd_seq_port_subscribe_set_dest(sub, &dst);
+    return snd_seq_get_port_subscription(seq, sub) == 0;
+}
+
+static int addr_equal(snd_seq_addr_t a, snd_seq_addr_t b)
+{
+    return a.client == b.client && a.port == b.port;
+}
+
+/* Is 'a' already being listened to on behalf of a different wanted device? */
+static int in_use_by_other(const struct want *w, snd_seq_addr_t a)
+{
+    for (int i = 0; i < nwants; i++)
+        if (&wants[i] != w && wants[i].connected && addr_equal(wants[i].cur, a))
+            return 1;
+    return 0;
+}
+
+/* Look for a readable port whose client and port names match this device. */
+static int find_port(const struct want *w, snd_seq_addr_t *out)
+{
+    snd_seq_client_info_t *ci;
+    snd_seq_port_info_t *pi;
+    int own = snd_seq_client_id(seq), found = 0;
+
+    snd_seq_client_info_alloca(&ci);
+    snd_seq_port_info_alloca(&pi);
+    snd_seq_client_info_set_client(ci, -1);
+
+    while (snd_seq_query_next_client(seq, ci) >= 0) {
+        int c = snd_seq_client_info_get_client(ci);
+        if (c == SND_SEQ_CLIENT_SYSTEM || c == own)
+            continue;
+        if (strcmp(snd_seq_client_info_get_name(ci), w->orig.device) != 0)
+            continue;
+        snd_seq_port_info_set_client(pi, c);
+        snd_seq_port_info_set_port(pi, -1);
+        while (snd_seq_query_next_port(seq, pi) >= 0) {
+            unsigned caps = snd_seq_port_info_get_capability(pi);
+            snd_seq_addr_t a = { c, snd_seq_port_info_get_port(pi) };
+            if ((caps & (SND_SEQ_PORT_CAP_READ | SND_SEQ_PORT_CAP_SUBS_READ)) !=
+                (SND_SEQ_PORT_CAP_READ | SND_SEQ_PORT_CAP_SUBS_READ))
+                continue;
+            if (caps & SND_SEQ_PORT_CAP_NO_EXPORT)
+                continue;
+            if (strcmp(snd_seq_port_info_get_name(pi), w->orig.name) != 0)
+                continue;
+            if (in_use_by_other(w, a))
+                continue;
+            if (addr_equal(a, w->cur)) {      /* same place as before: best match */
+                *out = a;
+                return 0;
+            }
+            if (!found) {
+                *out = a;
+                found = 1;
+            }
+        }
+    }
+    return found ? 0 : -1;
+}
+
+static uint64_t now_ns(void)
+{
+    struct timespec now;
+    int64_t d;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    d = (int64_t)(now.tv_sec - start_mono.tv_sec) * 1000000000LL +
+        (int64_t)(now.tv_nsec - start_mono.tv_nsec);
+    return d < 0 ? 0 : (uint64_t)d;
+}
+
+static void notify(mm_event_cb cb, const struct want *w, int type)
+{
+    mm_event e;
+
+    memset(&e, 0, sizeof e);
+    e.type = type;
+    e.time_ns = now_ns();
+    e.src_client = w->orig.client;
+    e.src_port = w->orig.port;
+    e.text = w->label;
+    cb(&e);
+}
+
+/* Verify every device is still subscribed; reconnect any that went away. */
+static void maintain(mm_event_cb cb)
+{
+    for (int i = 0; i < nwants; i++) {
+        struct want *w = &wants[i];
+        snd_seq_addr_t a;
+
+        if (w->connected && !subscription_exists(w->cur)) {
+            w->connected = 0;
+            notify(cb, w, MM_DEVICE_LOST);
+        }
+        if (!w->connected && find_port(w, &a) == 0 && subscribe(a) == 0) {
+            w->cur = a;
+            w->connected = 1;
+            notify(cb, w, MM_DEVICE_BACK);
+        }
+    }
+}
+
 int backend_start(const mm_port *sel, int n)
 {
     int err;
@@ -140,14 +273,47 @@ int backend_start(const mm_port *sel, int n)
         my_port = snd_seq_port_info_get_port(pi);
     }
 
+    wants = calloc((size_t)n, sizeof *wants);
+    if (!wants) {
+        fprintf(stderr, "Out of memory\n");
+        return -1;
+    }
+    nwants = n;
+
     for (int i = 0; i < n; i++) {
-        snd_seq_addr_t src = { sel[i].client, sel[i].port };
-        if ((err = subscribe(src)) < 0) {
+        struct want *w = &wants[i];
+        snd_seq_client_info_t *ci;
+        snd_seq_port_info_t *pi;
+
+        w->orig = sel[i];
+        w->cur.client = sel[i].client;
+        w->cur.port = sel[i].port;
+
+        /* Remember the device by name, so it can be found again later. */
+        snd_seq_client_info_alloca(&ci);
+        snd_seq_port_info_alloca(&pi);
+        if (snd_seq_get_any_client_info(seq, w->cur.client, ci) == 0)
+            snprintf(w->orig.device, sizeof w->orig.device, "%s", snd_seq_client_info_get_name(ci));
+        if (snd_seq_get_any_port_info(seq, w->cur.client, w->cur.port, pi) == 0)
+            snprintf(w->orig.name, sizeof w->orig.name, "%s", snd_seq_port_info_get_name(pi));
+        if (strcmp(w->orig.device, w->orig.name) == 0)
+            snprintf(w->label, sizeof w->label, "%s", w->orig.name);
+        else
+            snprintf(w->label, sizeof w->label, "%s : %s", w->orig.device, w->orig.name);
+
+        if ((err = subscribe(w->cur)) < 0) {
             fprintf(stderr, "Cannot subscribe to %d:%d: %s\n",
                     sel[i].client, sel[i].port, snd_strerror(err));
             return -1;
         }
+        w->connected = 1;
     }
+
+    /* Ask to be told when devices come and go (System:Announce). */
+    if ((err = snd_seq_connect_from(seq, my_port, SND_SEQ_CLIENT_SYSTEM,
+                                    SND_SEQ_PORT_SYSTEM_ANNOUNCE)) < 0)
+        fprintf(stderr, "warning: cannot watch for device changes (%s); "
+                        "reconnection will be slightly delayed\n", snd_strerror(err));
 
     if ((err = snd_seq_start_queue(seq, queue, NULL)) < 0 ||
         (err = snd_seq_drain_output(seq)) < 0)
@@ -166,16 +332,12 @@ static uint64_t event_ns(const snd_seq_event_t *ev)
 
     /* Kernel did not stamp this event: fall back to the system clock at the
      * moment we read it (less precise, but never zero). */
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
     if (!warned_fallback) {
         warned_fallback = 1;
         fprintf(stderr, "note: kernel timestamps unavailable, using "
                         "read-time timestamps instead\n");
     }
-    int64_t d = (int64_t)(now.tv_sec - start_mono.tv_sec) * 1000000000LL +
-                (int64_t)(now.tv_nsec - start_mono.tv_nsec);
-    return d < 0 ? 0 : (uint64_t)d;
+    return now_ns();
 }
 
 /* Translate an ALSA event into a neutral one. */
@@ -185,6 +347,13 @@ static void convert(const snd_seq_event_t *ev, mm_event *out)
     out->time_ns = event_ns(ev);
     out->src_client = ev->source.client;
     out->src_port = ev->source.port;
+    for (int i = 0; i < nwants; i++)          /* keep the label we started with */
+        if (wants[i].connected && wants[i].cur.client == ev->source.client &&
+            wants[i].cur.port == ev->source.port) {
+            out->src_client = wants[i].orig.client;
+            out->src_port = wants[i].orig.port;
+            break;
+        }
 
     switch (ev->type) {
     case SND_SEQ_EVENT_NOTEON:
@@ -241,22 +410,38 @@ void backend_run(mm_event_cb cb, volatile sig_atomic_t *running)
     int err;
     int npfd = snd_seq_poll_descriptors_count(seq, POLLIN);
     struct pollfd *pfd = alloca(npfd * sizeof *pfd);
+    struct timespec last, now;
+
     snd_seq_poll_descriptors(seq, pfd, npfd, POLLIN);
+    clock_gettime(CLOCK_MONOTONIC, &last);
 
     while (*running) {
-        if (poll(pfd, npfd, 500) <= 0)
-            continue;
-        snd_seq_event_t *ev;
-        do {
-            err = snd_seq_event_input(seq, &ev);
-            if (err == -ENOSPC) { fprintf(stderr, "*** input overrun, events lost ***\n"); continue; }
-            if (err < 0) break;
-            if (ev) {
-                mm_event e;
-                convert(ev, &e);
-                cb(&e);
-            }
-        } while (snd_seq_event_input_pending(seq, 0) > 0);
+        int check = 0;
+
+        if (poll(pfd, npfd, CHECK_INTERVAL_MS) > 0) {
+            snd_seq_event_t *ev;
+            do {
+                err = snd_seq_event_input(seq, &ev);
+                if (err == -ENOSPC) { fprintf(stderr, "*** input overrun, events lost ***\n"); continue; }
+                if (err < 0) break;
+                if (!ev)
+                    continue;
+                if (ev->source.client == SND_SEQ_CLIENT_SYSTEM) {
+                    check = 1;               /* a client or port came or went */
+                } else {
+                    mm_event e;
+                    convert(ev, &e);
+                    cb(&e);
+                }
+            } while (snd_seq_event_input_pending(seq, 0) > 0);
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (check || (now.tv_sec - last.tv_sec) * 1000L +
+                     (now.tv_nsec - last.tv_nsec) / 1000000L >= CHECK_INTERVAL_MS) {
+            maintain(cb);
+            last = now;
+        }
     }
 }
 
@@ -265,4 +450,7 @@ void backend_close(void)
     if (seq)
         snd_seq_close(seq);
     seq = NULL;
+    free(wants);
+    wants = NULL;
+    nwants = 0;
 }

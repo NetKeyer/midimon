@@ -186,6 +186,19 @@ static void momidi_prefix(const mm_event *ev)
     }
 }
 
+/* Forget everything known about a source's timing (its device went away). */
+static void momidi_reset(int client, int port)
+{
+    struct momidi_state *st = momidi_lookup(client, port);
+
+    if (st) {
+        memset(st, 0, sizeof *st);
+        st->used = 1;
+        st->client = client;
+        st->port = port;
+    }
+}
+
 static void momidi_event(const mm_event *ev)
 {
     struct momidi_state *st;
@@ -395,9 +408,28 @@ static void print_midi_line(const mm_event *ev)
 }
 
 
+/* A device went away or came back; the backend is handling reconnection. */
+static void print_device_event(const mm_event *ev)
+{
+    print_time(ev->time_ns);
+    printf("  %3d:%-2d  ** Device %s: %s%s\n", ev->src_client, ev->src_port,
+           ev->type == MM_DEVICE_LOST ? "disconnected" : "reconnected",
+           ev->text ? ev->text : "?",
+           ev->type == MM_DEVICE_LOST ? " - waiting for it to return" : "");
+    fflush(stdout);
+}
+
 static void on_event(const mm_event *ev)
 {
     int t = ev->type;
+
+    if (t == MM_DEVICE_LOST || t == MM_DEVICE_BACK) {
+        /* Always shown, whichever decoding is selected.  The device's own
+         * timer restarts when it reconnects, so MoMIDI timing starts over. */
+        print_device_event(ev);
+        momidi_reset(ev->src_client, ev->src_port);
+        return;
+    }
 
     if (opt_filter && (t == MM_CLOCK || t == MM_SENSING))
         return;

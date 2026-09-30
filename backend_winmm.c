@@ -17,6 +17,14 @@
  * Devices are addressed by their WinMM device number, shown in the listing
  * as "number:0".
  *
+ * Reconnection: when a device is unplugged its WinMM handle goes dead, and
+ * when it is plugged in again it may get a different device number.  So each
+ * device is also remembered by NAME.  The main thread checks twice a second
+ * whether each device is still listed (and its handle still valid), reports a
+ * loss, closes the dead handle, and keeps looking for a device with the same
+ * name; when it appears it is opened again.  Events keep the number label the
+ * device had at start-up, so the output stays consistent.
+ *
  * Limitation of WinMM: most drivers let only ONE program open a MIDI input
  * device at a time.  If another program (a logger, radio software, ...) has
  * the device open, opening it here fails.
@@ -38,18 +46,26 @@ const char *const backend_port_help = "a number from the list such as 1 or 1:0, 
 #define RING_N     1024          /* queue slots between callback and main thread */
 #define SYSEX_BUF  1024          /* bytes per SysEx input buffer                 */
 #define NBUF       4             /* SysEx input buffers per device               */
+#define CHECK_INTERVAL_MS 500    /* how often to verify / look for devices       */
 
 struct item {
     int src;                     /* index into sources[]                          */
     LONGLONG qpc;                /* QueryPerformanceCounter when data arrived     */
     unsigned len;                /* bytes in data[]                               */
     MIDIHDR *hdr;                /* SysEx buffer to give back, or NULL            */
+    int gen;                     /* source generation when queued (see struct source) */
     unsigned char data[SYSEX_BUF];
 };
 
 struct source {
-    int index;                   /* WinMM device number                           */
+    int index;                   /* current WinMM device number (may change)      */
     int id;                      /* position in sources[]                         */
+    int label_client, label_port;/* what the output calls this device             */
+    char name[96];               /* WinMM device name, UTF-8                      */
+    char label[200];             /* for messages                                  */
+    int connected;
+    int lost;                    /* a loss has been reported; waiting to return   */
+    volatile int gen;            /* incremented each time the device is reopened  */
     HMIDIIN h;
     int prepared;
     mm_parser parser;
@@ -67,6 +83,7 @@ static CRITICAL_SECTION ring_lock;
 static HANDLE ring_event;
 
 static LONGLONG qpc_freq, start_qpc;
+static int started;                      /* midiInStart has been called */
 
 /* ---- helpers ------------------------------------------------------------ */
 
@@ -113,6 +130,33 @@ static int contains_nocase(const char *hay, const char *needle)
             return 1;
     }
     return 0;
+}
+
+/* WinMM prefixes duplicate device names with "2- ", "3- " ...; ignore that. */
+static const char *strip_number_prefix(const char *n)
+{
+    const char *p = n;
+
+    while (*p >= '0' && *p <= '9')
+        p++;
+    if (p != n && p[0] == '-' && p[1] == ' ')
+        return p + 2;
+    return n;
+}
+
+/* Find the device number of a currently listed device with this name. */
+static int find_device(const char *name)
+{
+    UINT count = midiInGetNumDevs();
+
+    for (UINT i = 0; i < count; i++) {
+        mm_port p;
+        if (fill_port((long)i, &p) < 0)
+            continue;
+        if (strcmp(strip_number_prefix(p.name), strip_number_prefix(name)) == 0)
+            return (int)i;
+    }
+    return -1;
 }
 
 static uint64_t qpc_to_ns(LONGLONG q)
@@ -175,6 +219,7 @@ static void CALLBACK midi_proc(HMIDIIN h, UINT msg, DWORD_PTR instance,
     }
     it = &ring[ring_head];
     it->src = s->id;
+    it->gen = s->gen;
     it->qpc = now.QuadPart;
     it->hdr = hdr;
     if (hdr) {
@@ -258,6 +303,44 @@ static void report_open_error(int index, MMRESULT r)
                         "drivers allow only one program at a time to open a device.\n");
 }
 
+/* Open the WinMM device s->index and hand it its SysEx buffers. */
+static MMRESULT open_source(struct source *s)
+{
+    MMRESULT r = midiInOpen(&s->h, (UINT)s->index, (DWORD_PTR)midi_proc,
+                            (DWORD_PTR)s, CALLBACK_FUNCTION);
+
+    if (r != MMSYSERR_NOERROR) {
+        s->h = NULL;
+        return r;
+    }
+    s->gen++;
+    s->prepared = 0;
+    for (int b = 0; b < NBUF; b++) {
+        memset(&s->hdr[b], 0, sizeof s->hdr[b]);
+        s->hdr[b].lpData = (LPSTR)s->buf[b];
+        s->hdr[b].dwBufferLength = SYSEX_BUF;
+        if (midiInPrepareHeader(s->h, &s->hdr[b], sizeof s->hdr[b]) == MMSYSERR_NOERROR) {
+            s->prepared |= 1 << b;
+            midiInAddBuffer(s->h, &s->hdr[b], sizeof s->hdr[b]);
+        }
+    }
+    return MMSYSERR_NOERROR;
+}
+
+static void close_source(struct source *s)
+{
+    if (!s->h)
+        return;
+    midiInStop(s->h);
+    midiInReset(s->h);                      /* returns any queued SysEx buffers */
+    for (int b = 0; b < NBUF; b++)
+        if (s->prepared & (1 << b))
+            midiInUnprepareHeader(s->h, &s->hdr[b], sizeof s->hdr[b]);
+    midiInClose(s->h);
+    s->h = NULL;
+    s->prepared = 0;
+}
+
 int backend_start(const mm_port *sel, int n)
 {
     sources = calloc((size_t)n, sizeof *sources);
@@ -268,11 +351,12 @@ int backend_start(const mm_port *sel, int n)
 
     for (int i = 0; i < n; i++) {
         struct source *s;
+        mm_port p;
         MMRESULT r;
         int dup = 0;
 
         for (int j = 0; j < nsources; j++)
-            if (sources[j].index == sel[i].client)
+            if (sources[j].label_client == sel[i].client)
                 dup = 1;
         if (dup)
             continue;                       /* same device named twice */
@@ -280,25 +364,21 @@ int backend_start(const mm_port *sel, int n)
         s = &sources[nsources];
         s->index = sel[i].client;
         s->id = nsources;
+        s->label_client = sel[i].client;
+        s->label_port = sel[i].port;
+        if (fill_port(sel[i].client, &p) < 0)
+            p = sel[i];
+        snprintf(s->name, sizeof s->name, "%s", p.name);   /* remembered for reconnection */
+        snprintf(s->label, sizeof s->label, "%s", p.name);
         mm_parser_init(&s->parser, sel[i].client, sel[i].port);
         nsources++;                         /* counted now so backend_close cleans up */
 
-        r = midiInOpen(&s->h, (UINT)s->index, (DWORD_PTR)midi_proc,
-                       (DWORD_PTR)s, CALLBACK_FUNCTION);
+        r = open_source(s);
         if (r != MMSYSERR_NOERROR) {
-            s->h = NULL;
             report_open_error(s->index, r);
             return -1;
         }
-
-        for (int b = 0; b < NBUF; b++) {
-            s->hdr[b].lpData = (LPSTR)s->buf[b];
-            s->hdr[b].dwBufferLength = SYSEX_BUF;
-            if (midiInPrepareHeader(s->h, &s->hdr[b], sizeof s->hdr[b]) == MMSYSERR_NOERROR) {
-                s->prepared |= 1 << b;
-                midiInAddBuffer(s->h, &s->hdr[b], sizeof s->hdr[b]);
-            }
-        }
+        s->connected = 1;
     }
 
     {
@@ -309,12 +389,65 @@ int backend_start(const mm_port *sel, int n)
     return 0;
 }
 
+static void notify(mm_event_cb cb, const struct source *s, int type)
+{
+    mm_event e;
+    LARGE_INTEGER q;
+
+    QueryPerformanceCounter(&q);
+    memset(&e, 0, sizeof e);
+    e.type = type;
+    e.time_ns = qpc_to_ns(q.QuadPart);
+    e.src_client = s->label_client;
+    e.src_port = s->label_port;
+    e.text = s->label;
+    cb(&e);
+}
+
+/* Check every device is still listed; reopen any that went away and came back. */
+static void maintain(mm_event_cb cb)
+{
+    for (int i = 0; i < nsources; i++) {
+        struct source *s = &sources[i];
+        int id;
+
+        if (s->connected && find_device(s->name) < 0) {
+            close_source(s);                /* the handle is dead */
+            s->connected = 0;
+            s->lost = 1;
+            notify(cb, s, MM_DEVICE_LOST);
+        }
+        if (!s->connected && (id = find_device(s->name)) >= 0) {
+            int taken = 0;
+            for (int j = 0; j < nsources; j++)
+                if (&sources[j] != s && sources[j].connected && sources[j].index == id)
+                    taken = 1;
+            if (taken)
+                continue;
+            s->index = id;
+            mm_parser_reset(&s->parser);    /* drop any half-received message */
+            if (open_source(s) == MMSYSERR_NOERROR) {
+                if (started)
+                    midiInStart(s->h);
+                s->connected = 1;
+                if (s->lost) {
+                    s->lost = 0;
+                    notify(cb, s, MM_DEVICE_BACK);
+                }
+            }                               /* else: try again next time */
+        }
+    }
+}
+
 void backend_run(mm_event_cb cb, volatile sig_atomic_t *running)
 {
     static struct item it;                  /* working copy (too big for the stack) */
+    LARGE_INTEGER last, now;
 
     for (int i = 0; i < nsources; i++)
         midiInStart(sources[i].h);
+    started = 1;
+    QueryPerformanceCounter(&last);
 
     while (*running) {
         WaitForSingleObject(ring_event, 100);
@@ -342,8 +475,16 @@ void backend_run(mm_event_cb cb, volatile sig_atomic_t *running)
             s = &sources[it.src];
             mm_parser_feed(&s->parser, it.data, it.len, qpc_to_ns(it.qpc), cb);
 
-            if (it.hdr && *running)         /* give the SysEx buffer back to WinMM */
+            /* Give the SysEx buffer back to WinMM, unless that handle has
+             * been closed (or closed and reopened) since it was queued. */
+            if (it.hdr && *running && s->connected && it.gen == s->gen)
                 midiInAddBuffer(s->h, it.hdr, sizeof *it.hdr);
+        }
+
+        QueryPerformanceCounter(&now);
+        if ((now.QuadPart - last.QuadPart) * 1000 / qpc_freq >= CHECK_INTERVAL_MS) {
+            maintain(cb);
+            last = now;
         }
     }
 
@@ -355,16 +496,8 @@ void backend_run(mm_event_cb cb, volatile sig_atomic_t *running)
 void backend_close(void)
 {
     for (int i = 0; i < nsources; i++) {
-        struct source *s = &sources[i];
-        if (s->h) {
-            midiInReset(s->h);              /* returns any queued SysEx buffers */
-            for (int b = 0; b < NBUF; b++)
-                if (s->prepared & (1 << b))
-                    midiInUnprepareHeader(s->h, &s->hdr[b], sizeof s->hdr[b]);
-            midiInClose(s->h);
-            s->h = NULL;
-        }
-        mm_parser_free(&s->parser);
+        close_source(&sources[i]);
+        mm_parser_free(&sources[i].parser);
     }
     free(sources);
     sources = NULL;

@@ -21,6 +21,7 @@ It uses each system's native MIDI layer and has no third-party dependencies:
 - Decodes MoMIDI v0.1 timing, version queries and SysEx manufacturer IDs (see [MoMIDI decoding](#momidi-decoding))
 - Show both normal MIDI and MoMIDI (the default), only normal MIDI, or only MoMIDI
 - Monitor a single device, several devices, or all of them at once
+- Survives a device being unplugged and plugged back in: midimon notices, reports it, and starts listening again by itself
 - Optional filtering of noisy realtime messages (Timing Clock, Active Sensing)
 - Optional raw byte display
 - Plain text output, easy to pipe into `grep`, `tee`, or a log file
@@ -286,6 +287,34 @@ midimon is a passive monitor: it **does not answer** version queries or send any
 
 midimon follows v0.1 of the spec. Firmware written for the earlier v0.0 draft, which sent the high timing bits as a Control Change message and used a different meaning for velocity 0, will not decode the same way.
 
+## When a device is unplugged and plugged back in
+
+midimon keeps running when a device it is listening to disappears (USB cable pulled, keyer power-cycled, and so on) and starts listening again by itself when the device returns. You do not need to restart it. It reports both events in the output, with a timestamp like any other event:
+
+```
+    61.402113   0:0   ** Device disconnected: HaliKey Pro - waiting for it to return
+    75.118420   0:0   ** Device reconnected: HaliKey Pro
+```
+
+- These two lines are always shown, whichever decoding you selected (`-m` and `-M` do not hide them).
+- The address in the `Source` column stays the one the device had when midimon started, even if the operating system gives the device a different address when it comes back. You can therefore follow one device through a whole log.
+- **MoMIDI timing starts over.** A keyer's clock restarts when it reconnects, so midimon forgets the previous epoch and any half-finished key press. The first timed event after a reconnect is measured from a fresh epoch, as if midimon had just started.
+- The device is found again **by name**, not by address or number, because the operating system may assign a different one. It must come back with the same name. If you monitor two devices with identical names, midimon may mix them up after a reconnect.
+- If you monitor several devices and only one is unplugged, the others are not affected.
+- midimon only reconnects devices it was already listening to. A device that is missing when midimon starts is still an error, and other new devices that appear later are not picked up (restart midimon to list them).
+
+How quickly it reacts depends on the platform:
+
+| Platform | How it notices | Typical delay |
+|---|---|---|
+| Linux | Checks that its ALSA subscription still exists, and listens for ALSA's device announcements | Immediate |
+| macOS | Checks several times a second whether the CoreMIDI endpoint is still there | Up to about 0.25 s |
+| Windows | Checks twice a second whether the device is still in WinMM's device list | Up to about 0.5 s |
+
+On macOS and Windows, events the device sends in the first fraction of a second after it comes back may be missed.
+
+**Windows caveat:** reconnection relies on Windows updating its list of MIDI devices while a program is running. This is the least certain part of the Windows port and has only been tested with a simulated device. If midimon does not notice an unplug on your version of Windows, please report it.
+
 ## About the timestamps
 
 The timestamps come from the operating system, not from the program itself. Each incoming event is stamped when it arrives, so the times are accurate even if midimon is briefly delayed in reading or printing. midimon prints them to the microsecond.
@@ -325,7 +354,7 @@ The `snd_seq` kernel module may not be loaded: `sudo modprobe snd-seq`.
 The timestamp queue could not be started, so midimon is using read-time timestamps. Please check that you are running a current version of midimon (older versions had a bug here) and that the `snd_seq` and `snd_timer` modules are loaded.
 
 **A device is missing from the list**
-Only ports that export MIDI output (i.e. things that *send* MIDI) are listed. The list is taken when midimon starts, so devices plugged in afterwards require a restart. Some applications, such as software synths, only expose an input port and so will not appear.
+Only ports that export MIDI output (i.e. things that *send* MIDI) are listed. The list is taken when midimon starts, so a device that was not connected at that time requires a restart of midimon. Some applications, such as software synths, only expose an input port and so will not appear.
 
 **Nothing prints when I play**
 Try `-a` to make sure you picked the right port. Many devices expose several ports, and some controllers send their data on a secondary one. Also check that another program is not exclusively holding the device.
@@ -358,7 +387,7 @@ aplaymidi -p 128:0 somefile.mid
 
 - Linux (ALSA), macOS (CoreMIDI) and Windows (WinMM) only; no JACK-MIDI-only setups
 - Monitors input only; it does not send MIDI, and does not answer MoMIDI version queries
-- The device list is a snapshot taken at startup; hot-plugged devices need a restart
+- The device list is taken at startup. A monitored device that is unplugged and replugged is picked up again automatically (see above), but devices that were not present at startup, and other new devices, need a restart of midimon
 - On Windows, WinMM normally lets only one program use a MIDI device at a time (see Troubleshooting), and timestamps are taken when WinMM delivers the data rather than by the driver
 - The macOS backend uses CoreMIDI's classic MIDI 1.0 byte-stream API (deprecated by Apple in favour of the MIDI 2.0 API, but supported on all macOS versions); MIDI 2.0 devices are seen through Apple's MIDI 1.0 translation
 - Beyond MoMIDI, it displays events but does not interpret higher-level protocols (e.g. General MIDI, MMC, or manufacturer-specific SysEx content)

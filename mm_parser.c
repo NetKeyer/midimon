@@ -18,6 +18,14 @@ void mm_parser_free(mm_parser *p)
     p->sx_len = p->sx_cap = 0;
 }
 
+void mm_parser_reset(mm_parser *p)
+{
+    int client = p->src_client, port = p->src_port;
+
+    mm_parser_free(p);
+    mm_parser_init(p, client, port);
+}
+
 static void sx_append(mm_parser *p, unsigned char b)
 {
     if (p->sx_len >= SYSEX_MAX) { p->sx_overflow = 1; return; }

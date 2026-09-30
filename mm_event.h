@@ -16,6 +16,8 @@ enum mm_type {
     MM_TUNE_REQUEST,
     MM_CLOCK, MM_START, MM_CONTINUE, MM_STOP, MM_SENSING, MM_RESET,
     MM_SYSEX,                                      /* sysex, sysex_len          */
+    MM_DEVICE_LOST, MM_DEVICE_BACK,                /* text = device name; the backend
+                                                      is reconnecting by itself  */
     MM_OTHER                                       /* param = native type code  */
 };
 
@@ -29,6 +31,7 @@ typedef struct mm_event {
     int param, value;         /* controller number/value, or single data value   */
     const unsigned char *sysex;   /* full message including F0 ... F7            */
     unsigned sysex_len;
+    const char *text;         /* MM_DEVICE_LOST / MM_DEVICE_BACK: device name */
 } mm_event;
 
 /* Called by a backend for every event.  The event (and any sysex buffer it
