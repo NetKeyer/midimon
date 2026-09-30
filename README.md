@@ -14,7 +14,7 @@ Windows is not supported yet.
 ## Features
 
 - Runs on Linux (ALSA) and macOS (CoreMIDI), written in plain C with no external libraries
-- Lists all available MIDI input devices and ports, and lets you choose which to monitor
+- Lists all available MIDI input devices and ports, and lets you choose which to monitor (or picks the device for you if there is only one)
 - Decodes all standard MIDI messages (see [Decoded events](#decoded-events))
 - Timestamps taken by the operating system when each event arrives, with microsecond precision
 - Decodes MoMIDI v0.1 timing, version queries and SysEx manufacturer IDs (see [MoMIDI decoding](#momidi-decoding))
@@ -83,7 +83,7 @@ midimon [-l] [-p client:port | -p name] [-a] [-f] [-w] [-r] [-m | -M]
 | `-m` | MoMIDI only: hide the normal MIDI lines. Cannot be combined with `-M` |
 | `-h` | Show usage |
 
-With no `-p` or `-a`, midimon lists the available devices and prompts you to choose.
+With no `-p` or `-a`, midimon lists the available devices. If there is only one MIDI device it uses it automatically; if there are several it prompts you to choose. On Linux the virtual "Midi Through" port that ALSA always provides is not counted, so a machine with a single real keyer still selects it automatically. Use `-a` or `-p` to include or pick ports explicitly.
 
 The `Addr` column of the list (and the `Source` column of the output) identifies the device. On Linux it is the ALSA `client:port` address. On macOS it is the CoreMIDI source number followed by `:0`. The examples in this document use Linux-style addresses; on a Mac the same keyer might show up as `0:0`.
 
@@ -101,7 +101,7 @@ $ ./midimon -l
   1   32:0   HaliKey Pro : HaliKey Pro MIDI 1
 ```
 
-Pick a device interactively:
+Pick a device interactively (this prompt appears only when there is more than one real device; with just one, midimon says `Only one MIDI device found, using it.` and starts listening):
 
 ```
 $ ./midimon

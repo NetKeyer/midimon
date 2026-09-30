@@ -69,6 +69,7 @@ int backend_list(mm_port *out, int max)
             out[n].port   = snd_seq_port_info_get_port(pi);
             snprintf(out[n].device, sizeof out[n].device, "%s", snd_seq_client_info_get_name(ci));
             snprintf(out[n].name, sizeof out[n].name, "%s", snd_seq_port_info_get_name(pi));
+            out[n].loopback = (strcmp(out[n].device, "Midi Through") == 0);
             n++;
         }
     }

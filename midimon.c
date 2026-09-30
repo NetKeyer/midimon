@@ -5,7 +5,8 @@
  *
  * Usage:
  *   midimon -l                 list MIDI input devices/ports
- *   midimon                    list devices, then prompt for a selection
+ *   midimon                    list devices; use the only one automatically,
+ *                              or prompt for a selection if there are several
  *   midimon -p PORT            listen to one port (address or name; see -h)
  *   midimon -a                 listen to all devices
  *   Options: -f  hide clock / active-sensing spam
@@ -430,6 +431,17 @@ static void print_port_list(const mm_port *ports, int n)
                ports[i].device, ports[i].name);
 }
 
+/* Number of ports that are real devices (not software loopbacks). */
+static int real_count(const mm_port *ports, int n)
+{
+    int c = 0;
+
+    for (int i = 0; i < n; i++)
+        if (!ports[i].loopback)
+            c++;
+    return c;
+}
+
 int main(int argc, char **argv)
 {
     mm_port avail[MAX_PORTS], chosen[MAX_PORTS];
@@ -479,6 +491,12 @@ int main(int argc, char **argv)
             }
             nchosen++;
         }
+    } else if (real_count(avail, navail) == 1) {
+        /* Exactly one real device: no need to ask. */
+        for (int i = 0; i < navail; i++)
+            if (!avail[i].loopback)
+                chosen[nchosen++] = avail[i];
+        printf("\nOnly one MIDI device found, using it.\n");
     } else {
         char line[256];
         printf("\nSelect device number(s) (comma-separated, or 'a' for all): ");

@@ -16,6 +16,8 @@ typedef struct mm_port {
     int client, port;         /* backend-specific address, shown as client:port */
     char device[96];          /* device / client name */
     char name[96];            /* port name            */
+    int loopback;             /* 1 = software loopback such as ALSA "Midi Through",
+                                 not a real device (ignored when auto-selecting) */
 } mm_port;
 
 extern const char *const backend_name;        /* e.g. "ALSA sequencer" */
