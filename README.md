@@ -1,6 +1,8 @@
+This entire repo was vibe-coded in an afternoon by Claude.ai with @SmittyHalibut at the prompt.  It works well in my use case, but I haven't tested everything and don't claim it to be perfect.  If you find any problems, please reach out to mark-midimon@halibut.com.
+
 # midimon
 
-A command-line MIDI event monitor for Linux and macOS. It listens to one or more MIDI devices, decodes every event it receives, and prints each one with a microsecond-resolution timestamp.
+A command-line MIDI event monitor for Linux, macOS and Windows. It listens to one or more MIDI devices, decodes every event it receives, and prints each one with a microsecond-resolution timestamp.
 
 It also decodes **MoMIDI** ([Morse over MIDI](https://github.com/NetKeyer/MoMIDI-Spec)), turning the Note On/Off and aftertouch messages sent by MoMIDI keyers into millisecond timing for key-down, key-up and the gaps between them.
 
@@ -8,12 +10,11 @@ It uses each system's native MIDI layer and has no third-party dependencies:
 
 - **Linux:** the ALSA sequencer, so it works with USB MIDI devices, hardware MIDI interfaces, virtual ports (e.g. `snd-virmidi`), software synths, DAWs, and anything else that shows up in `aconnect -l`.
 - **macOS:** CoreMIDI, so it works with USB MIDI devices, the IAC Driver, network MIDI sessions, virtual sources created by other apps, and anything else that shows up in Audio MIDI Setup.
-
-Windows is not supported yet.
+- **Windows:** the classic WinMM `midiIn` API, so it works with USB MIDI devices and anything else that shows up as a MIDI input in Windows.
 
 ## Features
 
-- Runs on Linux (ALSA) and macOS (CoreMIDI), written in plain C with no external libraries
+- Runs on Linux (ALSA), macOS (CoreMIDI) and Windows (WinMM), written in plain C with no external libraries
 - Lists all available MIDI input devices and ports, and lets you choose which to monitor (or picks the device for you if there is only one)
 - Decodes all standard MIDI messages (see [Decoded events](#decoded-events))
 - Timestamps taken by the operating system when each event arrives, with microsecond precision
@@ -39,8 +40,9 @@ Windows is not supported yet.
 | openSUSE | `sudo zypper install gcc make alsa-devel` |
 
 - **macOS:** the Xcode command line tools (`xcode-select --install`). CoreMIDI ships with macOS, so nothing else is needed.
+- **Windows:** the program is built from a Linux shell, which on Windows means WSL. See [Building for Windows (using WSL)](#building-for-windows-using-wsl) below. Nothing needs to be installed on Windows itself to run the result.
 
-### Compile
+### Compile (Linux and macOS)
 
 ```
 make
@@ -56,6 +58,55 @@ cc -O2 -Wall -o midimon midimon.c mm_parser.c backend_alsa.c -lasound
 cc -O2 -Wall -o midimon midimon.c mm_parser.c backend_coremidi.c \
    -framework CoreMIDI -framework CoreFoundation
 ```
+
+### Building for Windows (using WSL)
+
+The Windows program, `midimon.exe`, is cross-compiled from a Linux shell. On a Windows PC the easiest way to get one is WSL (Windows Subsystem for Linux). You only need WSL to *build* the program; the resulting `midimon.exe` is an ordinary Windows program that runs without WSL.
+
+1. **Install WSL** if you don't already have it. Open PowerShell as Administrator, run the command below, and restart if asked. This installs Ubuntu.
+
+   ```
+   wsl --install
+   ```
+
+2. **Open the Ubuntu app** from the Start menu, and install the tools you need:
+
+   ```
+   sudo apt update
+   sudo apt install make gcc-mingw-w64-x86-64
+   ```
+
+3. **Get the source code into your WSL home directory** (for example with `git clone`, or by copying the files there). Keep it inside the Linux file system (`~/midimon`) rather than under `/mnt/c`, which is slower and can cause file timestamp problems.
+
+4. **Build it:**
+
+   ```
+   cd ~/midimon
+   make windows
+   ```
+
+   This produces `midimon.exe`. (Plain `make` builds the *Linux* version, which is not what you want here.)
+
+5. **Copy it to a normal Windows folder and run it from PowerShell or Command Prompt.** For example, to put it in your Windows home folder:
+
+   ```
+   cp midimon.exe /mnt/c/Users/YOURNAME/
+   ```
+
+   Then, in PowerShell:
+
+   ```
+   cd $HOME
+   .\midimon.exe -l
+   ```
+
+Notes:
+
+- `midimon.exe` needs nothing beyond what every Windows installation already has (`kernel32.dll`, `msvcrt.dll` and `winmm.dll`). You can copy it to any Windows PC.
+- It uses Windows' own MIDI system, so it sees your MIDI devices exactly as other Windows programs do. Don't try to run the Linux build inside WSL: WSL does not see USB MIDI devices by default.
+- The same steps work on any Debian/Ubuntu Linux machine, no WSL needed. On Fedora use `sudo dnf install make mingw64-gcc`.
+- Without make: `x86_64-w64-mingw32-gcc -O2 -Wall -o midimon.exe midimon.c mm_parser.c backend_winmm.c -lwinmm`
+- A Visual C++ build script (`build_msvc.bat`) is also included for people who already use Visual Studio. It is not required and has not been tested.
 
 ### Install (optional)
 
@@ -74,7 +125,7 @@ midimon [-l] [-p client:port | -p name] [-a] [-f] [-w] [-r] [-m | -M]
 | Option | Description |
 |---|---|
 | `-l` | List available MIDI input ports and exit |
-| `-p PORT` | Monitor this port. May be given more than once. On Linux, `PORT` is `client:port` (e.g. `32:0`) or a client name. On macOS it is the number from the list (e.g. `1` or `1:0`) or part of a device or port name (not case-sensitive) |
+| `-p PORT` | Monitor this port. May be given more than once. On Linux, `PORT` is `client:port` (e.g. `32:0`) or a client name. On macOS and Windows it is the number from the list (e.g. `1` or `1:0`) or part of a device or port name (not case-sensitive) |
 | `-a` | Monitor all available input ports |
 | `-f` | Filter out Timing Clock and Active Sensing messages |
 | `-w` | Show wall-clock time (`HH:MM:SS.uuuuuu`) instead of seconds since start |
@@ -85,7 +136,7 @@ midimon [-l] [-p client:port | -p name] [-a] [-f] [-w] [-r] [-m | -M]
 
 With no `-p` or `-a`, midimon lists the available devices. If there is only one MIDI device it uses it automatically; if there are several it prompts you to choose. On Linux the virtual "Midi Through" port that ALSA always provides is not counted, so a machine with a single real keyer still selects it automatically. Use `-a` or `-p` to include or pick ports explicitly.
 
-The `Addr` column of the list (and the `Source` column of the output) identifies the device. On Linux it is the ALSA `client:port` address. On macOS it is the CoreMIDI source number followed by `:0`. The examples in this document use Linux-style addresses; on a Mac the same keyer might show up as `0:0`.
+The `Addr` column of the list (and the `Source` column of the output) identifies the device. On Linux it is the ALSA `client:port` address. On macOS it is the CoreMIDI source number followed by `:0`, and on Windows the WinMM device number followed by `:0`. The examples in this document use Linux-style addresses; on a Mac the same keyer might show up as `0:0`.
 
 By default both the normal MIDI decoding and the MoMIDI decoding are displayed.
 
@@ -241,6 +292,7 @@ The timestamps come from the operating system, not from the program itself. Each
 
 - **Linux:** the ALSA sequencer stamps each event in the kernel, using a real-time queue with nanosecond resolution.
 - **macOS:** CoreMIDI stamps each packet with the host time at which the system received it (`mach_absolute_time`), which midimon converts to nanoseconds.
+- **Windows:** WinMM only provides millisecond timestamps, which is too coarse for Morse timing, so midimon reads the high-resolution performance counter (`QueryPerformanceCounter`) the instant WinMM calls it with new data. This is precise to well under a microsecond, but it measures when WinMM delivered the data, not when the driver received it, so it includes a small (normally sub-millisecond) delivery delay. It is therefore the least exact of the three platforms; for Morse timing, the device-measured MoMIDI times matter more.
 
 - **Default mode:** seconds since midimon started listening.
 - **`-w` mode:** wall-clock time, computed by adding the event time to the start time. This has a small fixed offset (typically microseconds) relative to the true wall clock, which is fine for correlating events with logs but not for cross-machine sync.
@@ -259,6 +311,12 @@ Keep in mind that the *physical* timing of MIDI is limited by the hardware: clas
 
 **"No MIDI input devices found."**
 On Linux, check that your device is detected: `aconnect -l` (from `alsa-utils`) or `amidi -l`. On macOS, open Audio MIDI Setup (Window > Show MIDI Studio) and check that the device appears there and is not greyed out. For USB devices, try `lsusb` and `dmesg | tail` to confirm it enumerated. Make sure your user can access the sound devices (usually membership in the `audio` group on older systems).
+
+**"Cannot find the MinGW-w64 compiler" when running `make windows`**
+Install it with `sudo apt install make gcc-mingw-w64-x86-64` (in WSL Ubuntu, or any Debian/Ubuntu system).
+
+**"Cannot open MIDI device N ... in use by another program"** (Windows)
+Most Windows MIDI drivers let only one program open a MIDI input at a time. Close whatever else is using the device (logging software, a DAW, radio software), or route the device through a virtual MIDI port that several programs can share, such as [loopMIDI](https://www.tobias-erichsen.de/software/loopmidi.html). Newer versions of Windows 11 with Windows MIDI Services may allow sharing, but that has not been tested with midimon.
 
 **"Cannot open ALSA sequencer"** (Linux)
 The `snd_seq` kernel module may not be loaded: `sudo modprobe snd-seq`.
@@ -298,9 +356,10 @@ aplaymidi -p 128:0 somefile.mid
 
 ## Limitations
 
-- Linux (ALSA) and macOS (CoreMIDI) only. No Windows support yet, and no JACK-MIDI-only setups
+- Linux (ALSA), macOS (CoreMIDI) and Windows (WinMM) only; no JACK-MIDI-only setups
 - Monitors input only; it does not send MIDI, and does not answer MoMIDI version queries
 - The device list is a snapshot taken at startup; hot-plugged devices need a restart
+- On Windows, WinMM normally lets only one program use a MIDI device at a time (see Troubleshooting), and timestamps are taken when WinMM delivers the data rather than by the driver
 - The macOS backend uses CoreMIDI's classic MIDI 1.0 byte-stream API (deprecated by Apple in favour of the MIDI 2.0 API, but supported on all macOS versions); MIDI 2.0 devices are seen through Apple's MIDI 1.0 translation
 - Beyond MoMIDI, it displays events but does not interpret higher-level protocols (e.g. General MIDI, MMC, or manufacturer-specific SysEx content)
 - MoMIDI decoding covers v0.1 of the spec only
@@ -314,8 +373,11 @@ aplaymidi -p 128:0 somefile.mid
 | `mm_event.h` | The neutral MIDI event type passed from a backend to the core |
 | `backend_alsa.c` | Linux backend (ALSA sequencer) |
 | `backend_coremidi.c` | macOS backend (CoreMIDI) |
-| `mm_parser.c`, `mm_parser.h` | Turns a raw MIDI byte stream into events (used by the macOS backend; handles running status, interleaved realtime bytes and split SysEx) |
-| `Makefile` | Build and install rules; picks the backend for your OS |
+| `backend_winmm.c` | Windows backend (WinMM) |
+| `platform.h` | Small portability layer for the core (`getopt` and time functions on Windows) |
+| `build_msvc.bat` | Optional build script for Microsoft Visual C++ (untested; the normal Windows build is `make windows` from WSL) |
+| `mm_parser.c`, `mm_parser.h` | Turns a raw MIDI byte stream into events (used by the macOS and Windows backends; handles running status, interleaved realtime bytes and split SysEx) |
+| `Makefile` | Build and install rules; picks the backend for your OS, and `make windows` cross-compiles the Windows program |
 | `README.md` | This file |
 
 To add another platform, write a new `backend_xxx.c` that implements `backend.h` and add it to the Makefile. The core does not need to change.

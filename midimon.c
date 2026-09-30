@@ -1,7 +1,9 @@
 /*
  * midimon - MIDI event monitor for Linux (ALSA) and macOS (CoreMIDI)
  *
- * Build:  make            (picks the backend for your OS; see Makefile)
+ * Build:  make            (Linux/macOS: picks the backend for your OS)
+ *          make windows    (cross-compiles midimon.exe; e.g. from WSL)
+ *          See the Makefile and README.md.
  *
  * Usage:
  *   midimon -l                 list MIDI input devices/ports
@@ -20,13 +22,14 @@
  * layer, and timestamping events as they arrive, is done by a backend
  * (backend_alsa.c or backend_coremidi.c); see backend.h.
  */
+#include "platform.h"      /* keep first: sets up the Windows CRT */
+
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>
 
 #include "backend.h"
 
@@ -85,7 +88,7 @@ static void print_time(uint64_t ns)
         time_t wt = start_real.tv_sec + sec + tot / 1000000000LL;
         long us = (tot % 1000000000LL) / 1000;
         struct tm tm;
-        localtime_r(&wt, &tm);
+        plat_localtime(&wt, &tm);
         printf("%02d:%02d:%02d.%06ld", tm.tm_hour, tm.tm_min, tm.tm_sec, us);
     } else {
         printf("%6ld.%06ld", sec, nsec / 1000);
@@ -448,10 +451,10 @@ int main(int argc, char **argv)
     const char *specs[MAX_PORTS];
     int nspecs = 0, nchosen = 0, do_list = 0, do_all = 0, opt;
 
-    while ((opt = getopt(argc, argv, "lp:afwrmMh")) != -1) {
+    while ((opt = plat_getopt(argc, argv, "lp:afwrmMh")) != -1) {
         switch (opt) {
         case 'l': do_list = 1; break;
-        case 'p': if (nspecs < MAX_PORTS) specs[nspecs++] = optarg; break;
+        case 'p': if (nspecs < MAX_PORTS) specs[nspecs++] = plat_optarg; break;
         case 'a': do_all = 1; break;
         case 'f': opt_filter = 1; break;
         case 'w': opt_wall = 1; break;
@@ -519,7 +522,7 @@ int main(int argc, char **argv)
 
     if (backend_start(chosen, nchosen) < 0)
         return 1;
-    clock_gettime(CLOCK_REALTIME, &start_real);   /* wall-clock at time_ns == 0 */
+    plat_realtime(&start_real);   /* wall-clock at time_ns == 0 */
 
     signal(SIGINT, on_sig);
     signal(SIGTERM, on_sig);
