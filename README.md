@@ -1,16 +1,22 @@
 # midimon
 
-A command-line MIDI event monitor for Linux. It listens to one or more MIDI devices, decodes every event it receives, and prints each one with a microsecond-resolution timestamp.
+A command-line MIDI event monitor for Linux and macOS. It listens to one or more MIDI devices, decodes every event it receives, and prints each one with a microsecond-resolution timestamp.
 
 It also decodes **MoMIDI** ([Morse over MIDI](https://github.com/NetKeyer/MoMIDI-Spec)), turning the Note On/Off and aftertouch messages sent by MoMIDI keyers into millisecond timing for key-down, key-up and the gaps between them.
 
-It is built on the ALSA sequencer API, so it works with USB MIDI devices, hardware MIDI interfaces, virtual ports (e.g. `snd-virmidi`), software synths, DAWs, and anything else that shows up in `aconnect -l`.
+It uses each system's native MIDI layer and has no third-party dependencies:
+
+- **Linux:** the ALSA sequencer, so it works with USB MIDI devices, hardware MIDI interfaces, virtual ports (e.g. `snd-virmidi`), software synths, DAWs, and anything else that shows up in `aconnect -l`.
+- **macOS:** CoreMIDI, so it works with USB MIDI devices, the IAC Driver, network MIDI sessions, virtual sources created by other apps, and anything else that shows up in Audio MIDI Setup.
+
+Windows is not supported yet.
 
 ## Features
 
+- Runs on Linux (ALSA) and macOS (CoreMIDI), written in plain C with no external libraries
 - Lists all available MIDI input devices and ports, and lets you choose which to monitor
 - Decodes all standard MIDI messages (see [Decoded events](#decoded-events))
-- Kernel-generated timestamps with microsecond precision
+- Timestamps taken by the operating system when each event arrives, with microsecond precision
 - Decodes MoMIDI v0.1 timing, version queries and SysEx manufacturer IDs (see [MoMIDI decoding](#momidi-decoding))
 - Show both normal MIDI and MoMIDI (the default), only normal MIDI, or only MoMIDI
 - Monitor a single device, several devices, or all of them at once
@@ -22,9 +28,8 @@ It is built on the ALSA sequencer API, so it works with USB MIDI devices, hardwa
 
 ### Requirements
 
-- Linux with ALSA (any modern distribution)
 - A C compiler (gcc or clang) and `make`
-- ALSA development headers:
+- **Linux:** ALSA development headers:
 
 | Distribution | Command |
 |---|---|
@@ -33,16 +38,23 @@ It is built on the ALSA sequencer API, so it works with USB MIDI devices, hardwa
 | Arch | `sudo pacman -S base-devel alsa-lib` |
 | openSUSE | `sudo zypper install gcc make alsa-devel` |
 
+- **macOS:** the Xcode command line tools (`xcode-select --install`). CoreMIDI ships with macOS, so nothing else is needed.
+
 ### Compile
 
 ```
 make
 ```
 
-Or without make:
+The Makefile detects your operating system and picks the matching MIDI backend. Without make:
 
 ```
-gcc -O2 -Wall -o midimon midimon.c -lasound
+# Linux
+cc -O2 -Wall -o midimon midimon.c mm_parser.c backend_alsa.c -lasound
+
+# macOS
+cc -O2 -Wall -o midimon midimon.c mm_parser.c backend_coremidi.c \
+   -framework CoreMIDI -framework CoreFoundation
 ```
 
 ### Install (optional)
@@ -62,7 +74,7 @@ midimon [-l] [-p client:port | -p name] [-a] [-f] [-w] [-r] [-m | -M]
 | Option | Description |
 |---|---|
 | `-l` | List available MIDI input ports and exit |
-| `-p PORT` | Monitor this port. `PORT` is either `client:port` (e.g. `32:0`) or a client name. May be given more than once |
+| `-p PORT` | Monitor this port. May be given more than once. On Linux, `PORT` is `client:port` (e.g. `32:0`) or a client name. On macOS it is the number from the list (e.g. `1` or `1:0`) or part of a device or port name (not case-sensitive) |
 | `-a` | Monitor all available input ports |
 | `-f` | Filter out Timing Clock and Active Sensing messages |
 | `-w` | Show wall-clock time (`HH:MM:SS.uuuuuu`) instead of seconds since start |
@@ -72,6 +84,8 @@ midimon [-l] [-p client:port | -p name] [-a] [-f] [-w] [-r] [-m | -M]
 | `-h` | Show usage |
 
 With no `-p` or `-a`, midimon lists the available devices and prompts you to choose.
+
+The `Addr` column of the list (and the `Source` column of the output) identifies the device. On Linux it is the ALSA `client:port` address. On macOS it is the CoreMIDI source number followed by `:0`. The examples in this document use Linux-style addresses; on a Mac the same keyer might show up as `0:0`.
 
 By default both the normal MIDI decoding and the MoMIDI decoding are displayed.
 
@@ -148,7 +162,6 @@ Press **Ctrl-C** to quit.
 | Category | Events |
 |---|---|
 | Channel voice | Note On, Note Off, Polyphonic Key Pressure, Control Change (common controllers named), Program Change, Channel Pressure, Pitch Bend |
-| Extended controllers | 14-bit controllers, RPN, NRPN |
 | System common | MTC Quarter Frame, Song Position Pointer, Song Select, Tune Request |
 | System realtime | Timing Clock, Start, Continue, Stop, Active Sensing, System Reset |
 | System exclusive | Full hex dump of the message |
@@ -224,12 +237,15 @@ midimon follows v0.1 of the spec. Firmware written for the earlier v0.0 draft, w
 
 ## About the timestamps
 
-The timestamps come from the ALSA sequencer, not from the program itself. Each incoming event is stamped by the kernel at the moment it arrives, using a real-time queue with nanosecond resolution; midimon prints this to the microsecond. This means the times are accurate even if the program is briefly delayed in reading or printing.
+The timestamps come from the operating system, not from the program itself. Each incoming event is stamped when it arrives, so the times are accurate even if midimon is briefly delayed in reading or printing. midimon prints them to the microsecond.
+
+- **Linux:** the ALSA sequencer stamps each event in the kernel, using a real-time queue with nanosecond resolution.
+- **macOS:** CoreMIDI stamps each packet with the host time at which the system received it (`mach_absolute_time`), which midimon converts to nanoseconds.
 
 - **Default mode:** seconds since midimon started listening.
 - **`-w` mode:** wall-clock time, computed by adding the event time to the start time. This has a small fixed offset (typically microseconds) relative to the true wall clock, which is fine for correlating events with logs but not for cross-machine sync.
 
-If for some reason the kernel does not stamp an event, midimon falls back to the system clock at the moment it reads the event, and prints this note once on stderr:
+On Linux, if for some reason the kernel does not stamp an event, midimon falls back to the system clock at the moment it reads the event, and prints this note once on stderr:
 
 ```
 note: kernel timestamps unavailable, using read-time timestamps instead
@@ -242,12 +258,12 @@ Keep in mind that the *physical* timing of MIDI is limited by the hardware: clas
 ## Troubleshooting
 
 **"No MIDI input devices found."**
-Check that your device is detected: `aconnect -l` (from `alsa-utils`) or `amidi -l`. For USB devices, try `lsusb` and `dmesg | tail` to confirm it enumerated. Make sure your user can access the sound devices (usually membership in the `audio` group on older systems).
+On Linux, check that your device is detected: `aconnect -l` (from `alsa-utils`) or `amidi -l`. On macOS, open Audio MIDI Setup (Window > Show MIDI Studio) and check that the device appears there and is not greyed out. For USB devices, try `lsusb` and `dmesg | tail` to confirm it enumerated. Make sure your user can access the sound devices (usually membership in the `audio` group on older systems).
 
-**"Cannot open ALSA sequencer"**
+**"Cannot open ALSA sequencer"** (Linux)
 The `snd_seq` kernel module may not be loaded: `sudo modprobe snd-seq`.
 
-**"warning: cannot start queue" or the "kernel timestamps unavailable" note**
+**"warning: cannot start queue" or the "kernel timestamps unavailable" note** (Linux)
 The timestamp queue could not be started, so midimon is using read-time timestamps. Please check that you are running a current version of midimon (older versions had a bug here) and that the `snd_seq` and `snd_timer` modules are loaded.
 
 **A device is missing from the list**
@@ -268,7 +284,10 @@ Use `-f`. Many sequencers and drum machines send 24 clock messages per beat.
 **"input overrun, events lost"**
 The kernel's input buffer filled up faster than midimon could drain it. This is rare, but can happen with very heavy SysEx or many devices at once. Redirecting output to a file (rather than a slow terminal) usually helps.
 
-**Virtual ports for testing without hardware**
+**Virtual ports for testing without hardware (macOS)**
+Enable the IAC Driver (Audio MIDI Setup > Window > Show MIDI Studio > double-click IAC Driver > tick "Device is online"). It appears as a MIDI source that other programs can send to.
+
+**Virtual ports for testing without hardware (Linux)**
 Load a virtual MIDI device with `sudo modprobe snd-virmidi`, then send data to it, for example:
 
 ```
@@ -279,9 +298,10 @@ aplaymidi -p 128:0 somefile.mid
 
 ## Limitations
 
-- Linux/ALSA only (no macOS, Windows, or JACK-MIDI-only setups)
+- Linux (ALSA) and macOS (CoreMIDI) only. No Windows support yet, and no JACK-MIDI-only setups
 - Monitors input only; it does not send MIDI, and does not answer MoMIDI version queries
 - The device list is a snapshot taken at startup; hot-plugged devices need a restart
+- The macOS backend uses CoreMIDI's classic MIDI 1.0 byte-stream API (deprecated by Apple in favour of the MIDI 2.0 API, but supported on all macOS versions); MIDI 2.0 devices are seen through Apple's MIDI 1.0 translation
 - Beyond MoMIDI, it displays events but does not interpret higher-level protocols (e.g. General MIDI, MMC, or manufacturer-specific SysEx content)
 - MoMIDI decoding covers v0.1 of the spec only
 
@@ -289,6 +309,13 @@ aplaymidi -p 128:0 somefile.mid
 
 | File | Purpose |
 |---|---|
-| `midimon.c` | Program source |
-| `Makefile` | Build and install rules |
+| `midimon.c` | Platform-independent part: options, output formatting, MoMIDI decoding |
+| `backend.h` | The interface each operating-system backend implements |
+| `mm_event.h` | The neutral MIDI event type passed from a backend to the core |
+| `backend_alsa.c` | Linux backend (ALSA sequencer) |
+| `backend_coremidi.c` | macOS backend (CoreMIDI) |
+| `mm_parser.c`, `mm_parser.h` | Turns a raw MIDI byte stream into events (used by the macOS backend; handles running status, interleaved realtime bytes and split SysEx) |
+| `Makefile` | Build and install rules; picks the backend for your OS |
 | `README.md` | This file |
+
+To add another platform, write a new `backend_xxx.c` that implements `backend.h` and add it to the Makefile. The core does not need to change.
