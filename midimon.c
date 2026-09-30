@@ -13,6 +13,8 @@
  *   Options: -f  hide clock / active-sensing spam
  *            -w  show wall-clock time instead of time-since-start
  *            -r  also show raw bytes for each event
+ *            -M  disable MoMIDI decoding (on by default)
+ *            -m  show only MoMIDI decoding (hide the normal MIDI lines)
  *
  * Timestamps come from the ALSA sequencer queue, i.e. they are taken by the
  * kernel when the event arrives (nanosecond resolution, printed here to
@@ -32,7 +34,10 @@
 
 static volatile sig_atomic_t running = 1;
 static int opt_filter, opt_wall, opt_raw;
-static struct timespec start_real;
+static int opt_midi = 1;     /* show normal MIDI decoding (-m turns off) */
+static int opt_momidi = 1;   /* show MoMIDI decoding      (-M turns off) */
+static struct timespec start_real, start_mono;
+static int warned_fallback;
 
 static void on_sig(int s) { (void)s; running = 0; }
 
@@ -126,21 +131,240 @@ static int subscribe(snd_seq_t *seq, int my_port, int queue, snd_seq_addr_t src)
 
 /* ---- output ----------------------------------------------------------- */
 
-static void print_time(const snd_seq_event_t *ev)
+/* Get the event's timestamp: kernel-provided if available, else the
+ * time we read it. */
+static void event_time(const snd_seq_event_t *ev, struct timespec *t)
 {
-    long sec = ev->time.time.tv_sec;
-    long usec = ev->time.time.tv_nsec / 1000;
+    if ((ev->flags & SND_SEQ_TIME_STAMP_MASK) == SND_SEQ_TIME_STAMP_REAL &&
+        (ev->time.time.tv_sec || ev->time.time.tv_nsec)) {
+        t->tv_sec  = ev->time.time.tv_sec;
+        t->tv_nsec = ev->time.time.tv_nsec;
+    } else {
+        /* Kernel did not stamp this event: fall back to the system clock
+         * at the moment we read it (less precise, but never zero). */
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        t->tv_sec  = now.tv_sec - start_mono.tv_sec;
+        t->tv_nsec = now.tv_nsec - start_mono.tv_nsec;
+        if (t->tv_nsec < 0) { t->tv_sec--; t->tv_nsec += 1000000000L; }
+        if (!warned_fallback) {
+            warned_fallback = 1;
+            fprintf(stderr, "note: kernel timestamps unavailable, using "
+                            "read-time timestamps instead\n");
+        }
+    }
+}
 
+static void print_time(const struct timespec *t)
+{
     if (opt_wall) {
-        long long ns = (long long)start_real.tv_nsec + ev->time.time.tv_nsec;
-        time_t t = start_real.tv_sec + sec + ns / 1000000000LL;
+        long long ns = (long long)start_real.tv_nsec + t->tv_nsec;
+        time_t wt = start_real.tv_sec + t->tv_sec + ns / 1000000000LL;
         long us = (ns % 1000000000LL) / 1000;
         struct tm tm;
-        localtime_r(&t, &tm);
+        localtime_r(&wt, &tm);
         printf("%02d:%02d:%02d.%06ld", tm.tm_hour, tm.tm_min, tm.tm_sec, us);
     } else {
-        printf("%6ld.%06ld", sec, usec);
+        printf("%6ld.%06ld", (long)t->tv_sec, (long)(t->tv_nsec / 1000));
     }
+}
+
+/* ---- MoMIDI (Morse over MIDI) decoding ---------------------------------
+ * Spec: https://github.com/NetKeyer/MoMIDI-Spec   (implements v0.1)
+ *
+ * Keying notes: 20 = left paddle (or straight key), 21 = right paddle,
+ * 30 = straight key, 31 = PTT.  Note On = key down, Note Off = key up.
+ *
+ * Timing: the Note velocity carries the low part of the time (ms) since the
+ * previous keying event.  Velocity 0 or 127 means "no timing information";
+ * such an event also becomes the epoch ("zero ms") for later timed events.
+ * An optional Polyphonic Aftertouch for the same note, sent just before the
+ * Note On/Off, carries the high part:
+ *
+ *      time_ms = velocity + pressure * 126        (no aftertouch = 0)
+ *
+ * Version: Song Select 0 is a version query; Song Select N (N != 0) reports
+ * MoMIDI version N (bits 6..4 major, 3..0 minor).
+ *
+ * SysEx: MoMIDI assigns its own manufacturer IDs (0x01..0x03 so far).
+ *
+ * This is a passive monitor: it never answers version queries.
+ * Note On with velocity 0 is treated as Note Off (standard MIDI convention).
+ * State is tracked per source port.
+ */
+#define MOMIDI_NKEYS     4
+#define MOMIDI_MAX_SRC   32
+#define MOMIDI_NOTE_LEFT 20
+
+static const int momidi_notes[MOMIDI_NKEYS] = { 20, 21, 30, 31 };
+static const char *const momidi_names[MOMIDI_NKEYS] =
+    { "left paddle/straight", "right paddle", "straight key", "PTT" };
+
+static int momidi_key(int note)
+{
+    for (int i = 0; i < MOMIDI_NKEYS; i++)
+        if (momidi_notes[i] == note) return i;
+    return -1;
+}
+
+struct momidi_state {
+    int used, client, port;
+    int at_valid, at_note, at_val;            /* pending aftertouch          */
+    long long round_ms;                       /* device ms since epoch       */
+    int round_valid;                          /* epoch known?                */
+    int down_valid[MOMIDI_NKEYS];             /* key-down time known?        */
+    long long down_at[MOMIDI_NKEYS];          /* round_ms when key went down */
+    int have_prev;
+    long long prev_ns;                        /* host time of previous event */
+};
+static struct momidi_state momidi_src[MOMIDI_MAX_SRC];
+
+static struct momidi_state *momidi_lookup(const snd_seq_addr_t *a)
+{
+    int i;
+    for (i = 0; i < MOMIDI_MAX_SRC; i++)
+        if (momidi_src[i].used && momidi_src[i].client == a->client &&
+            momidi_src[i].port == a->port)
+            return &momidi_src[i];
+    for (i = 0; i < MOMIDI_MAX_SRC; i++)
+        if (!momidi_src[i].used) {
+            memset(&momidi_src[i], 0, sizeof momidi_src[i]);
+            momidi_src[i].used = 1;
+            momidi_src[i].client = a->client;
+            momidi_src[i].port = a->port;
+            return &momidi_src[i];
+        }
+    return NULL;
+}
+
+static const char *momidi_mfg(int id)
+{
+    switch (id) {
+    case 0x01: return "Lynovations";
+    case 0x02: return "Halibut Electronics";
+    case 0x03: return "Remote Ham Radio";
+    default:   return NULL;
+    }
+}
+
+/* Start of a MoMIDI line.  Normally it sits under the MIDI line it decodes;
+ * in MoMIDI-only mode there is no MIDI line, so it carries its own
+ * timestamp and source. */
+static void momidi_prefix(const snd_seq_event_t *ev, const struct timespec *ts)
+{
+    if (opt_midi) {
+        printf("%*s", 15, "");
+    } else {
+        print_time(ts);
+        printf("  %3d:%-2d  ", ev->source.client, ev->source.port);
+    }
+}
+
+static void momidi_event(const snd_seq_event_t *ev, const struct timespec *ts)
+{
+    struct momidi_state *st;
+    int note, vel, k, down, at = 0, at_used = 0;
+    long long now_ns, time_ms = 0;
+
+    /* ---- Song Select: version query / version report ---- */
+    if (ev->type == SND_SEQ_EVENT_SONGSEL) {
+        int v = ev->data.control.value & 0x7F;
+        momidi_prefix(ev, ts);
+        printf(">> MoMIDI  ");
+        if (v == 0)
+            printf("version query (Song Select 0)\n");
+        else
+            printf("version v%d.%d (0x%02X)\n", (v >> 4) & 7, v & 0xF, v);
+        fflush(stdout);
+        return;
+    }
+
+    /* ---- SysEx: MoMIDI manufacturer IDs ---- */
+    if (ev->type == SND_SEQ_EVENT_SYSEX) {
+        const unsigned char *d = ev->data.ext.ptr;
+        unsigned n = ev->data.ext.len;
+        const char *m;
+        if (n >= 2 && d[0] == 0xF0 && (m = momidi_mfg(d[1])) != NULL) {
+            unsigned payload = n - 2 - (d[n - 1] == 0xF7 ? 1 : 0);
+            momidi_prefix(ev, ts);
+            printf(">> MoMIDI  SysEx, manufacturer ID 0x%02X (%s), "
+                   "%u data bytes\n", d[1], m, payload);
+            fflush(stdout);
+        }
+        return;
+    }
+
+    if (ev->type != SND_SEQ_EVENT_KEYPRESS &&
+        ev->type != SND_SEQ_EVENT_NOTEON &&
+        ev->type != SND_SEQ_EVENT_NOTEOFF)
+        return;
+    if (!(st = momidi_lookup(&ev->source)))
+        return;
+
+    note = ev->data.note.note;
+    vel  = ev->data.note.velocity;      /* pressure, for KEYPRESS */
+
+    /* Aftertouch: remember it for the next Note On/Off of the same note. */
+    if (ev->type == SND_SEQ_EVENT_KEYPRESS) {
+        if (momidi_key(note) >= 0) {
+            st->at_valid = 1;
+            st->at_note = note;
+            st->at_val = vel;
+        }
+        return;
+    }
+
+    /* Any Note On/Off consumes whatever aftertouch was pending. */
+    if (st->at_valid && st->at_note == note) {
+        at = st->at_val;
+        at_used = 1;
+    }
+    st->at_valid = 0;
+
+    if ((k = momidi_key(note)) < 0)
+        return;
+
+    down = (ev->type == SND_SEQ_EVENT_NOTEON && vel != 0);
+    now_ns = (long long)ts->tv_sec * 1000000000LL + ts->tv_nsec;
+
+    momidi_prefix(ev, ts);
+    printf(">> MoMIDI  %-22s %-4s  ", momidi_names[k], down ? "DOWN" : "UP");
+
+    if (vel == 0 || vel == 127) {
+        /* No timing information: this event is the new epoch. */
+        st->round_valid = 1;
+        st->round_ms = 0;
+        for (int i = 0; i < MOMIDI_NKEYS; i++) st->down_valid[i] = 0;
+        printf("no timing info (vel %d), new epoch", vel);
+        if (at_used && at != 0) printf(" (aftertouch %d ignored)", at);
+        if (down) { st->down_valid[k] = 1; st->down_at[k] = 0; }
+    } else {
+        time_ms = vel + (long long)at * 126;
+        if (!st->round_valid) {          /* joined mid-stream: epoch unseen */
+            st->round_valid = 1;
+            st->round_ms = 0;
+            for (int i = 0; i < MOMIDI_NKEYS; i++) st->down_valid[i] = 0;
+        }
+        st->round_ms += time_ms;
+        printf("+%lld ms", time_ms);
+        if (at_used) printf(" (%d*126 + %d)", at, vel);
+        printf("  epoch+%lld ms", st->round_ms);
+        if (down) {
+            st->down_valid[k] = 1;
+            st->down_at[k] = st->round_ms;
+        } else {
+            if (st->down_valid[k])
+                printf("  held %lld ms", st->round_ms - st->down_at[k]);
+            st->down_valid[k] = 0;
+        }
+    }
+
+    if (st->have_prev)
+        printf("  [host +%.3f ms]", (now_ns - st->prev_ns) / 1e6);
+    st->have_prev = 1;
+    st->prev_ns = now_ns;
+    putchar('\n');
+    fflush(stdout);
 }
 
 static void raw3(const char *fmt, int a, int b, int c)
@@ -149,25 +373,17 @@ static void raw3(const char *fmt, int a, int b, int c)
     if (opt_raw) { printf(fmt, a, b, c); printf("]"); }
 }
 
-static void print_event(snd_seq_t *seq, const snd_seq_event_t *ev)
+/* The normal (non-MoMIDI) one-line decode of an event. */
+static void print_midi_line(const snd_seq_event_t *ev, const struct timespec *ts)
 {
     char nb[8];
     const char *nm;
     int ch = ev->data.note.channel + 1;
     int t = ev->type;
 
-    if (opt_filter && (t == SND_SEQ_EVENT_CLOCK || t == SND_SEQ_EVENT_SENSING))
-        return;
-
-    /* time + source address and name */
-    print_time(ev);
-    {
-        snd_seq_client_info_t *ci;
-        snd_seq_client_info_alloca(&ci);
-        if (snd_seq_get_any_client_info(seq, ev->source.client, ci) < 0)
-            snd_seq_client_info_set_name(ci, "?");
-        printf("  %3d:%-2d  ", ev->source.client, ev->source.port);
-    }
+    /* time + source address */
+    print_time(ts);
+    printf("  %3d:%-2d  ", ev->source.client, ev->source.port);
 
     switch (t) {
     case SND_SEQ_EVENT_NOTEON:
@@ -265,6 +481,22 @@ static void print_event(snd_seq_t *seq, const snd_seq_event_t *ev)
     fflush(stdout);
 }
 
+static void print_event(snd_seq_t *seq, const snd_seq_event_t *ev)
+{
+    struct timespec ts;
+    int t = ev->type;
+    (void)seq;
+
+    if (opt_filter && (t == SND_SEQ_EVENT_CLOCK || t == SND_SEQ_EVENT_SENSING))
+        return;
+
+    event_time(ev, &ts);
+    if (opt_midi)
+        print_midi_line(ev, &ts);
+    if (opt_momidi)
+        momidi_event(ev, &ts);
+}
+
 /* ---- main --------------------------------------------------------------- */
 
 static void usage(const char *p)
@@ -276,7 +508,9 @@ static void usage(const char *p)
         "  -a  monitor all ports\n"
         "  -f  hide Timing Clock / Active Sensing\n"
         "  -w  wall-clock timestamps (default: seconds since start)\n"
-        "  -r  show raw MIDI bytes too\n", p);
+        "  -r  show raw MIDI bytes too\n"
+        "  -M  disable MoMIDI (Morse over MIDI) decoding\n"
+        "  -m  MoMIDI only: hide the normal MIDI decoding (cannot combine with -M)\n", p);
 }
 
 int main(int argc, char **argv)
@@ -286,7 +520,7 @@ int main(int argc, char **argv)
     const char *specs[MAX_PORTS];
     int nspecs = 0, nchosen = 0, do_list = 0, do_all = 0, opt, err;
 
-    while ((opt = getopt(argc, argv, "lp:afwrh")) != -1) {
+    while ((opt = getopt(argc, argv, "lp:afwrmMh")) != -1) {
         switch (opt) {
         case 'l': do_list = 1; break;
         case 'p': if (nspecs < MAX_PORTS) specs[nspecs++] = optarg; break;
@@ -294,11 +528,20 @@ int main(int argc, char **argv)
         case 'f': opt_filter = 1; break;
         case 'w': opt_wall = 1; break;
         case 'r': opt_raw = 1; break;
+        case 'm': opt_midi = 0; break;
+        case 'M': opt_momidi = 0; break;
         default:  usage(argv[0]); return opt == 'h' ? 0 : 1;
         }
     }
 
-    if ((err = snd_seq_open(&seq, "default", SND_SEQ_OPEN_INPUT, 0)) < 0) {
+    if (!opt_midi && !opt_momidi) {
+        fprintf(stderr, "-m and -M together would display nothing.\n");
+        return 1;
+    }
+
+    /* DUPLEX (not INPUT-only): starting the timestamp queue requires sending
+     * a control event to the system timer port, which needs an output buffer. */
+    if ((err = snd_seq_open(&seq, "default", SND_SEQ_OPEN_DUPLEX, 0)) < 0) {
         fprintf(stderr, "Cannot open ALSA sequencer: %s\n", snd_strerror(err));
         return 1;
     }
@@ -343,13 +586,27 @@ int main(int argc, char **argv)
         if (!nchosen) return 1;
     }
 
-    int my_port = snd_seq_create_simple_port(seq, "input",
-        SND_SEQ_PORT_CAP_WRITE | SND_SEQ_PORT_CAP_SUBS_WRITE,
-        SND_SEQ_PORT_TYPE_MIDI_GENERIC | SND_SEQ_PORT_TYPE_APPLICATION);
-    if (my_port < 0) { fprintf(stderr, "Cannot create port: %s\n", snd_strerror(my_port)); return 1; }
-
     int queue = snd_seq_alloc_named_queue(seq, "midimon");
     if (queue < 0) { fprintf(stderr, "Cannot allocate queue: %s\n", snd_strerror(queue)); return 1; }
+
+    /* Create our input port with kernel timestamping enabled: every event
+     * arriving here is stamped with the real time of queue 'queue'. */
+    int my_port;
+    {
+        snd_seq_port_info_t *pi;
+        snd_seq_port_info_alloca(&pi);
+        snd_seq_port_info_set_name(pi, "input");
+        snd_seq_port_info_set_capability(pi, SND_SEQ_PORT_CAP_WRITE | SND_SEQ_PORT_CAP_SUBS_WRITE);
+        snd_seq_port_info_set_type(pi, SND_SEQ_PORT_TYPE_MIDI_GENERIC | SND_SEQ_PORT_TYPE_APPLICATION);
+        snd_seq_port_info_set_timestamping(pi, 1);
+        snd_seq_port_info_set_timestamp_real(pi, 1);
+        snd_seq_port_info_set_timestamp_queue(pi, queue);
+        if ((err = snd_seq_create_port(seq, pi)) < 0) {
+            fprintf(stderr, "Cannot create port: %s\n", snd_strerror(err));
+            return 1;
+        }
+        my_port = snd_seq_port_info_get_port(pi);
+    }
 
     for (int i = 0; i < nchosen; i++) {
         if ((err = subscribe(seq, my_port, queue, chosen[i])) < 0) {
@@ -359,9 +616,11 @@ int main(int argc, char **argv)
         }
     }
 
-    snd_seq_start_queue(seq, queue, NULL);
-    snd_seq_drain_output(seq);
+    if ((err = snd_seq_start_queue(seq, queue, NULL)) < 0 ||
+        (err = snd_seq_drain_output(seq)) < 0)
+        fprintf(stderr, "warning: cannot start queue: %s\n", snd_strerror(err));
     clock_gettime(CLOCK_REALTIME, &start_real);
+    clock_gettime(CLOCK_MONOTONIC, &start_mono);
 
     signal(SIGINT, on_sig);
     signal(SIGTERM, on_sig);
